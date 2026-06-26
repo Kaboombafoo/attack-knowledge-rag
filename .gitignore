@@ -1,0 +1,5 @@
+.env
+.venv/
+__pycache__/
+enterprise-attack.json
+embeddings.npz
