@@ -3,3 +3,4 @@
 __pycache__/
 enterprise-attack.json
 embeddings.npz
+chroma_db/

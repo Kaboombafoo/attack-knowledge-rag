@@ -17,8 +17,10 @@ The pipeline has four stages:
 2. **Embed** — runs each technique through a local embedding model
    (`all-MiniLM-L6-v2`), turning its meaning into a 384-dimension vector. Vectors
    are cached so embedding only happens once.
-3. **Retrieve** — embeds the user's question with the same model and ranks every
-   technique by cosine similarity, returning the closest matches.
+3. **Retrieve** — embeds the user's question with the same model and queries a
+   Chroma vector database (cosine) for the nearest techniques. (v1 computed this
+   by hand with NumPy; v2 swaps in a real vector DB so retrieval scales beyond a
+   brute-force scan.)
 4. **Generate** — passes the retrieved techniques to Claude as context, with a
    strict instruction to answer *only* from them and cite technique IDs.
 
@@ -47,8 +49,8 @@ guardrail is driven by it.
 ## Roadmap
 
 - Add tactic-level and group/software documents to close the coverage gap.
-- Swap hand-rolled similarity for a real vector database (FAISS or Chroma).
 - Add reranking to improve retrieval precision.
+- Clean inline `(Citation: ...)` markers from source text.
 
 ## Running it
 
@@ -77,6 +79,6 @@ python search.py "how do attackers steal credentials from memory"
 
 ## Built with
 
-Python · sentence-transformers (`all-MiniLM-L6-v2`) · NumPy · Anthropic API (Claude Haiku) · MITRE ATT&CK (STIX)
+Python · sentence-transformers (`all-MiniLM-L6-v2`) · Chroma (vector DB) · Anthropic API (Claude Haiku) · MITRE ATT&CK (STIX)
 
 ATT&CK® is a registered trademark of The MITRE Corporation. Data used under MITRE's terms.
