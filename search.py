@@ -5,48 +5,50 @@ import json
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Connect to the vector database we built (no re-embedding the corpus).
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_collection("attack_techniques")
 
-# Same model as before — we still need it to embed the QUESTION.
-model = SentenceTransformer("all-MiniLM-L6-v2")
+bi_encoder = SentenceTransformer("all-MiniLM-L6-v2")
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-SCORE_THRESHOLD = 0.35   # on similarity (1 - distance); below this, refuse
+SCORE_THRESHOLD = 0.35
+FIRST_STAGE_K = 20
+FINAL_K = 5
 
 
 def answer(question):
-    # 1. RETRIEVE: embed the question, ask Chroma for the 5 nearest techniques.
-    query_vec = model.encode(question).tolist()
+    qvec = bi_encoder.encode(question).tolist()
     results = collection.query(
-        query_embeddings=[query_vec],
-        n_results=5,
+        query_embeddings=[qvec],
+        n_results=FIRST_STAGE_K,
         include=["documents", "distances", "metadatas"],
     )
-
     docs = results["documents"][0]
-    distances = results["distances"][0]
     metas = results["metadatas"][0]
-
-    # Chroma returns DISTANCE; convert to the similarity you know.
-    top_similarity = 1 - distances[0]
+    top_similarity = 1 - results["distances"][0][0]
 
     print(f'Question: "{question}"\n')
 
-    # 2. GUARDRAIL: if even the nearest match is weak, refuse honestly.
     if top_similarity < SCORE_THRESHOLD:
         print(f"(Top match similarity only {top_similarity:.3f} — retrieval is weak here.)")
         print("I don't have a strong match for that in the ATT&CK technique data.")
         return
 
-    # 3. GENERATE: hand the retrieved techniques to Claude as grounding context.
-    context = "\n\n---\n\n".join(docs)
+    pairs = [(question, doc) for doc in docs]
+    scores = cross_encoder.predict(pairs)
+    ranked = sorted(zip(docs, metas, scores), key=lambda x: x[2], reverse=True)
+    top = ranked[:FINAL_K]
+
+    top_docs = [d for d, m, s in top]
+    top_ids = [m["id"] for d, m, s in top]
+
+    context = "\n\n---\n\n".join(top_docs)
     anthropic_client = Anthropic()
     system_prompt = (
         "You are a security assistant. Answer the user's question using ONLY the "
@@ -63,9 +65,8 @@ def answer(question):
         messages=[{"role": "user", "content": user_message}],
     )
 
-    retrieved_ids = ", ".join(m["id"] for m in metas)
-    print("Retrieved techniques:", retrieved_ids)
-    print(f"(top match similarity: {top_similarity:.3f})\n")
+    print("Retrieved techniques (reranked):", ", ".join(top_ids))
+    print(f"(stage-1 top similarity: {top_similarity:.3f})\n")
     print(response.content[0].text)
 
 

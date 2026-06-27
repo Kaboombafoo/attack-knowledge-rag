@@ -1,56 +1,75 @@
 # ATT&CK Knowledge RAG
 
 A retrieval-augmented generation (RAG) system that answers security questions
-from the live MITRE ATT&CK knowledge base. Ask a plain-English question and it
-retrieves the most relevant ATT&CK techniques by meaning, then generates an
-answer grounded in those techniques — with citations, and an honest refusal when
-it has no good match.
+from the real MITRE ATT&CK knowledge base — and an evaluation harness that
+measures how well it actually retrieves.
 
-I built this to understand how semantic search and RAG actually work — the pipeline is assembled from primitives (a local embedding model, hand-computed cosine similarity, a direct LLM call) rather than a RAG framework or vector database. 
+Ask a plain-English question and it retrieves the most relevant ATT&CK techniques
+by meaning, reranks them for precision, and generates a grounded, cited answer —
+refusing honestly when it has no strong match.
+
+I built this to understand how semantic search, RAG, and retrieval evaluation
+actually work. The pipeline is assembled from primitives (a local embedding
+model, a vector database, a cross-encoder reranker, a direct LLM call) rather than
+a RAG framework.
 
 ## How it works
-
-The pipeline has four stages:
 
 1. **Ingest** — parses the official ATT&CK STIX dataset (697 enterprise
    techniques), skipping revoked/deprecated entries, into clean text documents.
 2. **Embed** — runs each technique through a local embedding model
-   (`all-MiniLM-L6-v2`), turning its meaning into a 384-dimension vector. Vectors
-   are cached so embedding only happens once.
-3. **Retrieve** — embeds the user's question with the same model and queries a
-   Chroma vector database (cosine) for the nearest techniques. (v1 computed this
-   by hand with NumPy; v2 swaps in a real vector DB so retrieval scales beyond a
-   brute-force scan.)
-4. **Generate** — passes the retrieved techniques to Claude as context, with a
-   strict instruction to answer *only* from them and cite technique IDs.
+   (`all-MiniLM-L6-v2`) into a 384-dimension vector. Vectors are cached.
+3. **Retrieve** — embeds the question and queries a Chroma vector database
+   (cosine) for a broad candidate set.
+4. **Rerank** — a cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores the
+   candidates by reading the question and each technique *together*, then keeps
+   the best five. This fixes cases where similar techniques (e.g. Golden Ticket
+   vs. Silver Ticket) blur under embedding-only search.
+5. **Generate** — passes the reranked techniques to Claude with a strict
+   instruction to answer *only* from them and cite technique IDs.
 
-The embedding model is frozen and general-purpose — it positions the ATT&CK
-documents using language understanding it learned during its own training; the
-dataset is not used to train it.
+A guardrail refuses to answer when the best retrieval score is weak, rather than
+forcing an answer from poor matches.
 
-## Honest behavior on weak matches
+## Evaluation
 
-If the top retrieval score falls below a threshold, the system refuses to answer
-rather than forcing a response from poor matches — because a RAG answer is only as
-good as what retrieval found. Retrieval quality is visible in the score, so the
-guardrail is driven by it.
+Retrieval quality is measured, not guessed. `evaluate.py` runs a hand-built
+golden set of 38 questions (each tagged with the ATT&CK technique that should be
+retrieved) and reports recall@5.
 
-## Limitations
+The development of the retriever was driven by this harness:
 
-- **Naive RAG.** Single similarity pass — no reranking, no query expansion.
-- **Technique-level coverage only.** The knowledge base contains individual
-  techniques, not ATT&CK's higher-level *tactics*. So broad, category-level
-  questions (e.g. "lateral movement" as a whole) often score low and get refused
-  — not because the topic is invalid, but because no single technique document is
-  a close match. This is a coverage gap, not a topic gap.
-- **No source-text cleanup.** ATT&CK descriptions still contain inline
-  `(Citation: ...)` markers.
+| Stage | Recall@5 |
+|-------|----------|
+| Dense retrieval (baseline) | 76.5% |
+| Hybrid search (dense + BM25) | tested, no improvement — rejected |
+| Dense + cross-encoder reranker | **97.1%** |
 
-## Roadmap
+Two findings worth noting:
 
-- Add tactic-level and group/software documents to close the coverage gap.
-- Add reranking to improve retrieval precision.
-- Clean inline `(Citation: ...)` markers from source text.
+- **Hybrid search did not help here.** I hypothesized that adding BM25 keyword
+  search would improve exact-term retrieval, and tested it three ways (naive
+  fusion, weighted fusion, adaptive query-routing). None beat dense-only on this
+  corpus — ATT&CK descriptions are conceptual prose, which plays to embeddings'
+  strength. I rejected the added complexity rather than ship it. The experiment
+  is preserved in `hybrid.py`.
+- **Auditing the benchmark mattered.** Several apparent failures were stale labels
+  in my golden set caused by ATT&CK's technique renumbering — cases where the
+  system retrieved correctly but the answer key was outdated. Verifying every
+  label against the current dataset is part of the harness (a label-validation
+  sweep), and is why the final number is trustworthy.
+
+The one remaining failure at 97.1% is a genuine sub-technique-precision limit, not
+a benchmark error.
+
+## Limitations & roadmap
+
+- **Conceptual prose only.** Strong on technique-level questions; weak on
+  category-level ("lateral movement" as a whole) and set queries ("list all
+  techniques that...") — see the expected-fail cases in the golden set.
+- **Sub-technique precision** is the main remaining failure mode.
+- Roadmap: add tactic/group/software documents to close the category gap;
+  experiment with domain-fine-tuned embeddings.
 
 ## Running it
 
@@ -59,7 +78,7 @@ Requires Python 3.11+ and an Anthropic API key.
 \`\`\`bash
 python -m venv .venv
 source .venv/bin/activate
-pip install sentence-transformers numpy anthropic python-dotenv requests
+pip install sentence-transformers chromadb rank-bm25 numpy anthropic python-dotenv requests
 \`\`\`
 
 Create a `.env` file (never committed):
@@ -72,13 +91,15 @@ Build the knowledge base, then query it:
 
 \`\`\`bash
 curl -L -o enterprise-attack.json https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack.json
-python ingest.py     # parse techniques
-python embed.py      # build embeddings (one time)
+python ingest.py      # parse techniques
+python embed.py       # build embeddings (one time)
+python build_db.py    # load into the vector database
 python search.py "how do attackers steal credentials from memory"
+python evaluate.py    # run the retrieval evaluation
 \`\`\`
 
 ## Built with
 
-Python · sentence-transformers (`all-MiniLM-L6-v2`) · Chroma (vector DB) · Anthropic API (Claude Haiku) · MITRE ATT&CK (STIX)
+Python · sentence-transformers · Chroma (vector DB) · cross-encoder reranker · Anthropic API (Claude Haiku) · MITRE ATT&CK (STIX)
 
-ATT&CK® is a registered trademark of The MITRE Corporation. Data used under MITRE's terms.
+ATT&CK® is a registered trademark of The MITRE Corporation.
